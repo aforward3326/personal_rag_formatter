@@ -5,6 +5,7 @@ import asyncio
 import logging
 import uuid
 import sys
+import hashlib
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -18,6 +19,10 @@ import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 
+# Import for postgres
+import asyncpg
+from pgvector.asyncpg import register_vector
+
 # Load environment variables from .env file
 load_dotenv('../pipeline.env')
 
@@ -27,10 +32,18 @@ load_dotenv('../pipeline.env')
 DATA_DIR = os.getenv("DATA_DIR", "../output_final_rag_data")
 VECTOR_DB_TYPE = os.getenv("VECTOR_DB_TYPE", "chromadb").lower()
 CHROMA_DB_DIR = os.getenv("CHROMA_DB_DIR", "../chroma_db")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "enterprise_knowledge")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "writing_style_logs")
 
 CHROMA_DB_HOST = os.getenv("CHROMA_DB_HOST")
 CHROMA_DB_PORT = os.getenv("CHROMA_DB_PORT")
+
+# Postgres settings
+PG_HOST = os.getenv("PG_HOST")
+PG_PORT = os.getenv("PG_PORT")
+PG_USER = os.getenv("PG_USER")
+PG_PASSWORD = os.getenv("PG_PASSWORD")
+PG_DB_NAME = os.getenv("PG_DB_NAME")
+
 
 # AI & Embedding Providers
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
@@ -65,15 +78,11 @@ elif AI_PROVIDER == "openai":
         raise ValueError("OPENAI_API_KEY is not set in the environment or pipeline.env file.")
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 else:
-    # 這裡可以根據其他 AI_PROVIDER 初始化對應的 Client
-    # 例如 gemini, anthropic 等，這部分需要額外實作或套件支援
-    # logger is not initialized yet here, move it below.
     if AI_PROVIDER == "gemini":
-         client = AsyncOpenAI(api_key=GEMINI_API_KEY) # 假設有支援 OpenAI 格式轉發
+         client = AsyncOpenAI(api_key=GEMINI_API_KEY)
     elif AI_PROVIDER == "anthropic":
-         client = AsyncOpenAI(api_key=ANTHROPIC_API_KEY) # 假設有支援 OpenAI 格式轉發
+         client = AsyncOpenAI(api_key=ANTHROPIC_API_KEY)
     else:
-        # Default to OpenAI key format if none match specifically, but warn user
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Setup logging
@@ -82,7 +91,6 @@ def setup_logger():
     base_log_filename = f"{PROCESS_NAME}_{date_str}.log"
     log_file_path = process_log_dir / base_log_filename
 
-    # Handle max 1GB log size and batching
     batch = 1
     while log_file_path.exists() and log_file_path.stat().st_size > 1 * 1024 * 1024 * 1024:
         log_file_path = process_log_dir / f"{PROCESS_NAME}_{date_str}_{batch}.log"
@@ -165,10 +173,6 @@ class ContentAnalysisResult(BaseModel):
     retry=retry_if_exception_type((openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError))
 )
 async def analyze_content_with_llm(page_content: str, semaphore: asyncio.Semaphore) -> ContentAnalysisResult:
-    """
-    Calls a lightweight LLM to perform smart filtering and metadata augmentation.
-    Leverages OpenAI's Structured Outputs feature (supported by OpenAI and compatible APIs).
-    """
     async with semaphore:
         response = await client.beta.chat.completions.parse(
             model=LLM_MODEL_NAME,
@@ -184,6 +188,19 @@ async def analyze_content_with_llm(page_content: str, semaphore: asyncio.Semapho
         )
         return response.choices[0].message.parsed
 
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type((openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError))
+)
+async def get_embeddings(texts: List[str], model: str, semaphore: asyncio.Semaphore) -> List[List[float]]:
+    if not texts:
+        return []
+    
+    async with semaphore:
+        response = await client.embeddings.create(input=texts, model=model)
+        return [data.embedding for data in response.data]
+
 
 # ==========================================
 # 3. Main Data Pipeline
@@ -193,7 +210,6 @@ async def process_and_ingest_data():
     logger.info("Process Started")
     logger.info("Starting RAG data ingestion pipeline...")
 
-    # Check directory
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
         logger.warning(f"Data directory {DATA_DIR} was not found, created a new empty one. Please place your JSON files there.")
@@ -213,7 +229,6 @@ async def process_and_ingest_data():
     total_files = progress_data.get("total_files", 0)
     metrics = progress_data.get("metrics", {"total_read": 0, "noise_filtered": 0, "successful_chunks": 0, "processing_errors": 0})
 
-    # Load JSON files
     file_pattern = os.path.join(DATA_DIR, "*.json")
     all_files = glob.glob(file_pattern)
     files_to_process = [f for f in all_files if f not in processed_files]
@@ -225,38 +240,76 @@ async def process_and_ingest_data():
         logger.info("No new files to process.")
         return
 
-    # Control API concurrency
     semaphore = asyncio.Semaphore(20)
     
     logger.info("Initializing Vector Database...")
-    if EMBEDDING_PROVIDER == "lm_studio":
-        import chromadb.utils.embedding_functions as embedding_functions
+    embedding_func = None
+    if VECTOR_DB_TYPE == "chromadb" or EMBEDDING_PROVIDER == "lm_studio":
+        if EMBEDDING_PROVIDER == "lm_studio":
+            import chromadb.utils.embedding_functions as embedding_functions
 
-        class LocalOpenAIEmbeddingFunction(embedding_functions.EmbeddingFunction):
-            def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
-                from openai import OpenAI
-                sync_client = OpenAI(base_url=LM_STUDIO_BASE_URL, api_key=LM_STUDIO_API_KEY)
-                response = sync_client.embeddings.create(input=input, model=EMBEDDING_MODEL_NAME)
-                return [data.embedding for data in response.data]
+            class LocalOpenAIEmbeddingFunction(embedding_functions.EmbeddingFunction):
+                def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
+                    from openai import OpenAI
+                    sync_client = OpenAI(base_url=LM_STUDIO_BASE_URL, api_key=LM_STUDIO_API_KEY)
+                    response = sync_client.embeddings.create(input=input, model=EMBEDDING_MODEL_NAME)
+                    return [data.embedding for data in response.data]
 
-        embedding_func = LocalOpenAIEmbeddingFunction()
-    else:
-        embedding_func = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=OPENAI_API_KEY,
-            model_name=EMBEDDING_MODEL_NAME
+            embedding_func = LocalOpenAIEmbeddingFunction()
+        else:
+            embedding_func = embedding_functions.OpenAIEmbeddingFunction(
+                api_key=OPENAI_API_KEY,
+                model_name=EMBEDDING_MODEL_NAME
+            )
+
+    db_connection = None
+    collection = None
+    if VECTOR_DB_TYPE == "postgres":
+        logger.info(f"Connecting to Postgres vector store at {PG_HOST}:{PG_PORT}")
+        db_connection = await asyncpg.connect(
+            host=PG_HOST,
+            port=PG_PORT,
+            user=PG_USER,
+            password=PG_PASSWORD,
+            database=PG_DB_NAME
         )
+        await register_vector(db_connection)
+        await db_connection.execute(f"""
+            CREATE TABLE IF NOT EXISTS {COLLECTION_NAME} (
+                id serial4 NOT NULL,
+                file_name varchar(255) NOT NULL,
+                raw_content text NOT NULL,
+                ai_summary text NULL,
+                data_source varchar(100) NULL,
+                content_category varchar(100) NULL,
+                style_tags text[] NULL,
+                is_noise boolean DEFAULT false NOT NULL,
+                information_weight numeric(3, 2) DEFAULT 0.50 NULL,
+                content_hash varchar(64) NOT NULL,
+                chunk_index int4 DEFAULT 0 NOT NULL,
+                embedding public.vector(1536) NULL,
+                original_time timestamptz NULL,
+                created_at timestamptz DEFAULT CURRENT_TIMESTAMP NULL,
+                CONSTRAINT writing_style_logs_pkey PRIMARY KEY (id),
+                CONSTRAINT uq_file_chunk UNIQUE (content_hash, chunk_index)
+            );
+        """)
 
-    if CHROMA_DB_HOST and CHROMA_DB_PORT:
-        logger.info(f"Connecting to remote ChromaDB server at {CHROMA_DB_HOST}:{CHROMA_DB_PORT}")
-        chroma_client = chromadb.HttpClient(host=CHROMA_DB_HOST, port=CHROMA_DB_PORT)
+    elif VECTOR_DB_TYPE == "chromadb":
+        if CHROMA_DB_HOST and CHROMA_DB_PORT:
+            logger.info(f"Connecting to remote ChromaDB server at {CHROMA_DB_HOST}:{CHROMA_DB_PORT}")
+            chroma_client = chromadb.HttpClient(host=CHROMA_DB_HOST, port=CHROMA_DB_PORT)
+        else:
+            logger.info(f"Connecting to local ChromaDB instance at {CHROMA_DB_DIR}")
+            chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+
+        collection = chroma_client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embedding_func
+        )
     else:
-        logger.info(f"Connecting to local ChromaDB instance at {CHROMA_DB_DIR}")
-        chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+        raise ValueError(f"Unsupported VECTOR_DB_TYPE: {VECTOR_DB_TYPE}")
 
-    collection = chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=embedding_func
-    )
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
@@ -274,8 +327,6 @@ async def process_and_ingest_data():
                     if isinstance(data, list):
                         docs.extend(data)
                     elif isinstance(data, dict):
-                        # Handle potential wrapped formats like {"corpus": [...]} or {"messages": [...]}
-                        # Try to extract the list if it's there
                         extracted_list = None
                         for key, val in data.items():
                             if isinstance(val, list):
@@ -309,62 +360,95 @@ async def process_and_ingest_data():
                     metrics["processing_errors"] += 1
                     continue
 
-                if result.is_noise:
-                    metrics["noise_filtered"] += 1
-                    continue
+                doc["analysis"] = result
+                valid_docs.append(doc)
 
-                original_meta = doc.get("metadata", {})
-                enhanced_meta = {
-                    **original_meta,
-                    "generated_tags": ",".join(result.generated_tags),
-                    "content_category": result.content_category,
-                    "information_weight": result.information_weight
-                }
-
-                # Ensure all metadata values are primitive for ChromaDB
-                safe_meta = {}
-                for k, v in enhanced_meta.items():
-                    if isinstance(v, (str, int, float, bool)):
-                        safe_meta[k] = v
-                    elif isinstance(v, list):
-                        safe_meta[k] = ",".join([str(item) for item in v])
-                    else:
-                        safe_meta[k] = str(v)
-
-                valid_docs.append({
-                    "page_content": doc.get("page_content", ""),
-                    "metadata": safe_meta
-                })
 
             chunks_to_insert = []
             for doc_idx, doc in enumerate(valid_docs):
                 chunks = text_splitter.split_text(doc["page_content"])
+                analysis_result = doc["analysis"]
 
                 for chunk_idx, chunk_text in enumerate(chunks):
-                    chunk_meta = doc["metadata"].copy()
-                    chunk_meta["chunk_index"] = chunk_idx
-
-                    source_id = chunk_meta.get("source", f"doc_{doc_idx}")
-                    doc_id = f"{source_id}_chunk_{chunk_idx}_{uuid.uuid4().hex[:6]}"
-
+                    content_hash = hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()
+                    
                     chunks_to_insert.append({
-                        "id": doc_id,
-                        "text": chunk_text,
-                        "metadata": chunk_meta
+                        "file_name": os.path.basename(filepath),
+                        "raw_content": chunk_text,
+                        "ai_summary": None, # Placeholder for summary
+                        "data_source": doc.get("metadata", {}).get("source"),
+                        "content_category": analysis_result.content_category,
+                        "style_tags": analysis_result.generated_tags,
+                        "is_noise": analysis_result.is_noise,
+                        "information_weight": analysis_result.information_weight,
+                        "content_hash": content_hash,
+                        "chunk_index": chunk_idx,
+                        "original_time": doc.get("metadata", {}).get("created_at"),
                     })
 
             metrics["successful_chunks"] += len(chunks_to_insert)
 
             if chunks_to_insert:
-                batch_size = 500
-                for i in range(0, len(chunks_to_insert), batch_size):
-                    batch = chunks_to_insert[i: i + batch_size]
-                    collection.add(
-                        ids=[c["id"] for c in batch],
-                        documents=[c["text"] for c in batch],
-                        metadatas=[c["metadata"] for c in batch]
+                if VECTOR_DB_TYPE == "postgres":
+                    texts_to_embed = [c["raw_content"] for c in chunks_to_insert]
+                    embeddings = []
+
+                    if EMBEDDING_PROVIDER == "openai":
+                        batch_size = 100
+                        for i in range(0, len(texts_to_embed), batch_size):
+                            batch_texts = texts_to_embed[i:i+batch_size]
+                            batch_embeddings = await get_embeddings(batch_texts, EMBEDDING_MODEL_NAME, semaphore)
+                            embeddings.extend(batch_embeddings)
+
+                    elif EMBEDDING_PROVIDER == "lm_studio":
+                        if embedding_func:
+                            loop = asyncio.get_running_loop()
+                            embeddings = await loop.run_in_executor(None, embedding_func, texts_to_embed)
+                        else:
+                            logger.error("LM Studio embedding function not initialized.")
+                            continue
+                    else:
+                        logger.error(f"Unsupported embedding provider for Postgres: {EMBEDDING_PROVIDER}")
+                        continue
+                    
+                    if not embeddings:
+                        logger.warning("No embeddings were generated.")
+                        continue
+
+                    records_to_insert = []
+                    for i, chunk in enumerate(chunks_to_insert):
+                        records_to_insert.append(
+                            (
+                                chunk["file_name"], chunk["raw_content"], chunk["ai_summary"],
+                                chunk["data_source"], chunk["content_category"], chunk["style_tags"],
+                                chunk["is_noise"], chunk["information_weight"], chunk["content_hash"],
+                                chunk["chunk_index"], embeddings[i], chunk["original_time"]
+                            )
+                        )
+                    
+                    await db_connection.executemany(
+                        f"""
+                        INSERT INTO {COLLECTION_NAME} (
+                            file_name, raw_content, ai_summary, data_source, content_category,
+                            style_tags, is_noise, information_weight, content_hash, chunk_index,
+                            embedding, original_time
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                        ON CONFLICT (content_hash, chunk_index) DO NOTHING
+                        """,
+                        records_to_insert
                     )
-                logger.info(f"Inserted {len(chunks_to_insert)} chunks into Vector DB for file {os.path.basename(filepath)}.")
+                    logger.info(f"Inserted {len(chunks_to_insert)} chunks into Postgres for file {os.path.basename(filepath)}.")
+
+                elif VECTOR_DB_TYPE == "chromadb":
+                    batch_size = 500
+                    for i in range(0, len(chunks_to_insert), batch_size):
+                        batch = chunks_to_insert[i: i + batch_size]
+                        collection.add(
+                            ids=[c["id"] for c in batch],
+                            documents=[c["text"] for c in batch],
+                            metadatas=[c["metadata"] for c in batch]
+                        )
+                    logger.info(f"Inserted {len(chunks_to_insert)} chunks into Vector DB for file {os.path.basename(filepath)}.")
 
             processed_files.append(filepath)
             total_files += 1
@@ -396,9 +480,12 @@ async def process_and_ingest_data():
         logger.error(f"Unexpected error occurred: {e}", exc_info=True)
         save_progress(progress_data)
         sys.exit(1)
+    finally:
+        if db_connection:
+            await db_connection.close()
+
 
 if __name__ == "__main__":
-    # Ensure asyncio event loop runs correctly
     try:
         asyncio.run(process_and_ingest_data())
     except KeyboardInterrupt:
