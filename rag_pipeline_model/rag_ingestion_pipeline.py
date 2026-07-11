@@ -338,6 +338,121 @@ async def _insert_chunks_to_db(
             logger.error(f"Failed to insert/update batch into ChromaDB: {e}")
             metrics["processing_errors"] += len(chunks_batch) # Count as errors for these chunks
 
+async def parse_rag_ready_json(json_data: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
+    """
+    Parses JSON data from various 'rag_ready' formats into a flat list of documents.
+    Each document will have 'page_content' and a 'metadata' dictionary.
+    """
+    documents = []
+
+    # Helper to standardize metadata
+    def standardize_metadata(raw_metadata: Dict[str, Any], default_source: str = "unknown") -> Dict[str, Any]:
+        standardized = {}
+        # Map timestamp to original_time
+        if "timestamp" in raw_metadata:
+            standardized["original_time"] = raw_metadata.pop("timestamp")
+        
+        # Map source to data_source
+        if "source" in raw_metadata:
+            standardized["data_source"] = raw_metadata.pop("source")
+        elif "data_source" not in standardized:
+            standardized["data_source"] = default_source
+        
+        # Add any remaining metadata
+        standardized.update(raw_metadata)
+        return standardized
+
+    # --- Handle chat_html_to_rag.py and meta_data_to_rag.py (messages part) ---
+    if "messages" in json_data and isinstance(json_data["messages"], list):
+        for thread in json_data["messages"]:
+            if not isinstance(thread, dict): continue
+            thread_id = thread.get("thread_id", str(uuid.uuid4()))
+            thread_metadata = standardize_metadata(thread.get("metadata", {}), default_source="chat_html")
+            
+            if "conversation" in thread and isinstance(thread["conversation"], list):
+                for message in thread["conversation"]:
+                    if not isinstance(message, dict): continue
+                    msg_page_content = message.get("page_content")
+                    if not msg_page_content: continue
+
+                    msg_metadata = standardize_metadata(message.get("metadata", {}), default_source=thread_metadata.get("data_source", "chat_html"))
+                    
+                    # Merge thread-level and message-level metadata
+                    final_metadata = {
+                        **thread_metadata,
+                        **msg_metadata,
+                        "thread_id": thread_id,
+                        "message_id": message.get("message_id", str(uuid.uuid4()))
+                    }
+                    documents.append({"page_content": msg_page_content, "metadata": final_metadata})
+
+    # --- Handle gmail_to_rag.py ---
+    elif "email_threads" in json_data and isinstance(json_data["email_threads"], list):
+        for thread in json_data["email_threads"]:
+            if not isinstance(thread, dict): continue
+            thread_id = thread.get("thread_id", str(uuid.uuid4()))
+            subject = thread.get("subject", "No Subject")
+            thread_metadata = standardize_metadata(thread.get("metadata", {}), default_source="gmail")
+
+            if "conversation" in thread and isinstance(thread["conversation"], list):
+                for message in thread["conversation"]:
+                    if not isinstance(message, dict): continue
+                    msg_page_content = message.get("page_content")
+                    if not msg_page_content: continue
+
+                    msg_metadata = standardize_metadata(message.get("metadata", {}), default_source=thread_metadata.get("data_source", "gmail"))
+                    
+                    # Merge thread-level and message-level metadata
+                    final_metadata = {
+                        **thread_metadata,
+                        **msg_metadata,
+                        "thread_id": thread_id,
+                        "subject": subject,
+                        "message_id": message.get("message_id", str(uuid.uuid4()))
+                    }
+                    documents.append({"page_content": msg_page_content, "metadata": final_metadata})
+
+    # --- Handle meta_data_to_rag.py (posts part) ---
+    elif "posts" in json_data and isinstance(json_data["posts"], list):
+        for post in json_data["posts"]:
+            if not isinstance(post, dict): continue
+            post_id = post.get("post_id", str(uuid.uuid4()))
+            post_page_content = post.get("page_content")
+            post_metadata = standardize_metadata(post.get("metadata", {}), default_source="meta_post")
+
+            if post_page_content:
+                final_metadata = {**post_metadata, "post_id": post_id}
+                documents.append({"page_content": post_page_content, "metadata": final_metadata})
+            
+            # Handle comments within posts
+            if "comments" in post and isinstance(post["comments"], list):
+                for comment in post["comments"]:
+                    if not isinstance(comment, dict): continue
+                    comment_page_content = comment.get("page_content")
+                    if not comment_page_content: continue
+
+                    comment_metadata = standardize_metadata(comment.get("metadata", {}), default_source=post_metadata.get("data_source", "meta_comment"))
+                    
+                    final_metadata = {
+                        **post_metadata, # Inherit post metadata
+                        **comment_metadata, # Override with comment metadata if keys overlap
+                        "post_id": post_id,
+                        "comment_id": comment.get("comment_id", str(uuid.uuid4()))
+                    }
+                    documents.append({"page_content": comment_page_content, "metadata": final_metadata})
+    
+    # --- Fallback for simple list of documents or single document ---
+    elif isinstance(json_data, list):
+        for item in json_data:
+            if isinstance(item, dict) and "page_content" in item:
+                documents.append({"page_content": item["page_content"], "metadata": standardize_metadata(item.get("metadata", {}), default_source="unknown_list")})
+    elif isinstance(json_data, dict) and "page_content" in json_data:
+        documents.append({"page_content": json_data["page_content"], "metadata": standardize_metadata(json_data.get("metadata", {}), default_source="unknown_single")})
+    else:
+        logger.warning(f"File {file_name} has an unrecognized JSON structure. No documents extracted.")
+
+    return documents
+
 
 # ==========================================
 # 3. Main Data Pipeline
@@ -466,20 +581,10 @@ async def process_and_ingest_data():
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if isinstance(data, list):
-                        docs.extend(data)
-                    elif isinstance(data, dict):
-                        extracted_list = None
-                        for key, val in data.items():
-                            if isinstance(val, list):
-                                extracted_list = val
-                                break
-                        if extracted_list:
-                            docs.extend(extracted_list)
-                        else:
-                            docs.append(data)
+                    # Use the new structured parsing function
+                    docs = await parse_rag_ready_json(data, current_file_name)
             except Exception as e:
-                logger.error(f"Failed to read {current_file_name}: {e}")
+                logger.error(f"Failed to read or parse {current_file_name}: {e}")
                 metrics["processing_errors"] += 1
                 continue
 
@@ -515,60 +620,7 @@ async def process_and_ingest_data():
                 valid_docs.append(doc)
 
             file_chunks_count = 0
-            # Collect all chunk_indices for the current file to query existing hashes efficiently
-            # This assumes that the text_splitter will produce chunks with sequential indices starting from 0
-            # For each doc, we need to know how many chunks it will produce to get the range of indices
-            all_chunk_indices_for_file = []
-            for doc_in_valid_docs in valid_docs:
-                temp_chunks = text_splitter.split_text(doc_in_valid_docs["page_content"])
-                all_chunk_indices_for_file.extend(range(len(temp_chunks))) # This is not correct, chunk_index is per doc.
-            
-            # Correct way to get all chunk indices for the file:
-            # We need to iterate through valid_docs and then its chunks to get the actual chunk_indices
-            # This is a bit tricky because chunk_index is per doc, not global for the file.
-            # Let's assume chunk_index is unique per file for simplicity for now, or we need a more complex key.
-            # The current schema uses (file_name, chunk_index) as unique, implying chunk_index is unique per file.
-            # If chunk_index is per document, then the unique key should be (file_name, doc_id, chunk_index).
-            # Given the current schema, I will assume chunk_index is unique within a file.
-            # If not, the schema needs to be updated to include a document identifier.
-
-            # Re-evaluating: The current `chunk_index` is per document.
-            # `uq_file_chunk UNIQUE (file_name, chunk_index)` means that for a given file,
-            # there can only be one chunk with `chunk_index = 0`, one with `chunk_index = 1`, etc.
-            # This is problematic if a file contains multiple documents, and each document is chunked.
-            # The `chunk_index` should be unique per (file_name, original_document_identifier).
-            # For now, I will proceed with the assumption that `chunk_index` is unique per file,
-            # and if a file contains multiple documents, their chunks will overwrite each other if they have the same chunk_index.
-            # A more robust solution would be to add a `document_id` to the schema and use `(file_name, document_id, chunk_index)` as unique.
-            # For this request, I will stick to the current schema and assume `chunk_index` is unique per file.
-
-            # Let's collect all potential chunk indices for the current file.
-            # This is still problematic if multiple documents in a file produce chunks with the same index.
-            # I will modify the `chunk_index` to be a global index within the file for this implementation.
-            # This means `chunk_index` will be `global_chunk_counter` for the file.
-
-            all_generated_chunks_for_file = []
-            for doc_in_valid_docs in valid_docs:
-                chunks_from_doc = text_splitter.split_text(doc_in_valid_docs["page_content"])
-                for chunk_text in chunks_from_doc:
-                    all_generated_chunks_for_file.append({
-                        "raw_content": chunk_text,
-                        "data_source": doc_in_valid_docs.get("metadata", {}).get("source"),
-                        "content_category": doc_in_valid_docs["analysis"].content_category,
-                        "style_tags": doc_in_valid_docs["analysis"].generated_tags,
-                        "is_noise": doc_in_valid_docs["analysis"].is_noise,
-                        "information_weight": doc_in_valid_docs["analysis"].information_weight,
-                        "original_time": doc_in_valid_docs.get("metadata", {}).get("created_at"),
-                    })
-            
-            # Now, query existing hashes for all potential chunk indices in this file
-            # We need to know the maximum chunk_index that could be generated for this file.
-            # This is still not ideal. The `get_existing_chunk_hashes` should be called for specific (file_name, chunk_index) pairs.
-            # Let's adjust the logic to query for each chunk as it's generated, or query for a range of chunk_indices.
-            # For simplicity and to avoid over-fetching, I will query for each chunk as it's processed.
-            # This might increase DB calls but ensures correctness with the current schema.
-
-            global_chunk_idx_for_file = 0
+            global_chunk_idx_for_file = 0 # Reset for each file
             for doc_idx, doc in enumerate(valid_docs):
                 chunks = text_splitter.split_text(doc["page_content"])
                 analysis_result = doc["analysis"]
@@ -602,14 +654,14 @@ async def process_and_ingest_data():
                         "file_name": current_file_name,
                         "raw_content": chunk_text,
                         "ai_summary": None, # Placeholder for summary
-                        "data_source": doc.get("metadata", {}).get("source"),
+                        "data_source": doc.get("metadata", {}).get("data_source"), # Use data_source from metadata
                         "content_category": analysis_result.content_category,
                         "style_tags": analysis_result.generated_tags,
                         "is_noise": analysis_result.is_noise,
                         "information_weight": analysis_result.information_weight,
                         "content_hash": content_hash,
                         "chunk_index": global_chunk_idx_for_file, # Use global index for uniqueness per file
-                        "original_time": doc.get("metadata", {}).get("created_at"),
+                        "original_time": doc.get("metadata", {}).get("original_time"), # Use original_time from metadata
                     })
                     file_chunks_count += 1
                     global_chunk_idx_for_file += 1
