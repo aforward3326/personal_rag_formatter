@@ -1,0 +1,22 @@
+# IDE and tool-specific files
+.idea/
+.continue/
+
+# Local secrets and environment configuration
+.key/
+log/
+*.env
+!.env.example
+!pipeline.env.example
+
+# Example folder
+AI-Chat_example/
+
+# Data folders
+org_data/
+output_clean_data/
+output_final_rag_data/
+output_mask_data/
+
+# Test folder
+test/
