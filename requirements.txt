@@ -1,6 +1,7 @@
 # Core AI and data handling libraries
 openai
 langchain
+langchain-text-splitters
 pydantic
 tenacity
 python-dotenv

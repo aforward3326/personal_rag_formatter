@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 import openai
 from openai import AsyncOpenAI
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pathlib import Path
 import chromadb
 from chromadb.utils import embedding_functions
