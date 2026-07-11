@@ -1,1 +1,27 @@
-requests==2.31.0
+# Core AI and data handling libraries
+openai
+langchain
+pydantic
+tenacity
+python-dotenv
+
+# Vector database clients
+chromadb
+asyncpg
+pgvector
+
+# Document parsing
+beautifulsoup4
+python-docx
+python-pptx
+pdfplumber
+PyMuPDF
+easyocr
+
+# Anonymization
+presidio-analyzer
+presidio-anonymizer
+spacy
+
+# Other utilities
+requests
