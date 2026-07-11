@@ -599,81 +599,74 @@ async def process_and_ingest_data():
 
             metrics["total_read"] += len(docs)
 
-            logger.info(f"Starting AI analysis for {len(docs)} documents in {current_file_name}...")
-            tasks = [analyze_content_with_llm(doc.get("page_content", ""), semaphore) for doc in docs]
-            analysis_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            valid_docs = []
-            for doc_idx_in_file, (doc, result) in enumerate(zip(docs, analysis_results)):
-                logger.info(f"  Processing record {doc_idx_in_file + 1}/{len(docs)} in {current_file_name} for AI analysis and chunking.")
-                if isinstance(result, Exception):
-                    logger.warning(f"  Error analyzing record {doc_idx_in_file + 1} in {current_file_name}: {result}")
-                    metrics["processing_errors"] += 1
-                    continue
-                
-                if result.is_noise:
-                    logger.info(f"  Record {doc_idx_in_file + 1} in {current_file_name} identified as noise. Skipping.")
-                    metrics["noise_filtered"] += 1
-                    continue
-
-                doc["analysis"] = result
-                valid_docs.append(doc)
-
-            file_chunks_count = 0
-            global_chunk_idx_for_file = 0 # Reset for each file
-            for doc_idx, doc in enumerate(valid_docs):
-                chunks = text_splitter.split_text(doc["page_content"])
-                analysis_result = doc["analysis"]
-
-                logger.info(f"  Chunking document {doc_idx + 1}/{len(valid_docs)} from {current_file_name}. Generated {len(chunks)} chunks.")
-
-                for chunk_idx_in_doc, chunk_text in enumerate(chunks):
-                    content_hash = hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()
-                    
-                    # Query for existing chunk hash for this specific (file_name, global_chunk_idx_for_file)
-                    existing_chunk_hashes = await get_existing_chunk_hashes(
-                        current_file_name,
-                        [global_chunk_idx_for_file], # Query for a single chunk_index
-                        db_connection,
-                        chroma_collection
-                    )
-                    existing_hash = existing_chunk_hashes.get(global_chunk_idx_for_file)
-
-                    if existing_hash == content_hash:
-                        logger.info(f"  Chunk (file: {current_file_name}, index: {global_chunk_idx_for_file}) is a duplicate. Skipping.")
-                        global_chunk_idx_for_file += 1
-                        continue # Skip this chunk, it's already in the DB and unchanged
-                    elif existing_hash: # Exists but hash is different
-                        logger.info(f"  Chunk (file: {current_file_name}, index: {global_chunk_idx_for_file}) has been modified. Will update.")
-                        # Add to batch for update
-                    else: # Does not exist
-                        logger.info(f"  Chunk (file: {current_file_name}, index: {global_chunk_idx_for_file}) is new. Will insert.")
-                        # Add to batch for insert
-
-                    current_batch_chunks.append({
-                        "file_name": current_file_name,
-                        "raw_content": chunk_text,
-                        "ai_summary": None, # Placeholder for summary
-                        "data_source": doc.get("metadata", {}).get("data_source"), # Use data_source from metadata
-                        "content_category": analysis_result.content_category,
-                        "style_tags": analysis_result.generated_tags,
-                        "is_noise": analysis_result.is_noise,
-                        "information_weight": analysis_result.information_weight,
-                        "content_hash": content_hash,
-                        "chunk_index": global_chunk_idx_for_file, # Use global index for uniqueness per file
-                        "original_time": doc.get("metadata", {}).get("original_time"), # Use original_time from metadata
-                    })
-                    file_chunks_count += 1
-                    global_chunk_idx_for_file += 1
-
-                    if len(current_batch_chunks) >= BATCH_SIZE:
-                        await _insert_chunks_to_db(current_batch_chunks, db_connection, chroma_collection, semaphore, embedding_func, metrics)
-                        current_batch_chunks = [] # Clear batch after insertion
-                        # Save progress after each batch insertion
-                        progress_data["metrics"] = metrics
-                        save_progress(progress_data)
+            logger.info(f"Starting incremental AI analysis for {len(docs)} documents in {current_file_name}...")
             
-            logger.info(f"Finished processing {current_file_name}. Total chunks generated from this file: {file_chunks_count}.")
+            # 設定 AI 處理的子批次大小 (例如每 20 筆做一次結算)
+            AI_SUB_BATCH_SIZE = 20
+            global_chunk_idx_for_file = 0 # Reset for each file
+            file_chunks_count = 0
+
+            for i in range(0, len(docs), AI_SUB_BATCH_SIZE):
+                sub_docs = docs[i : i + AI_SUB_BATCH_SIZE]
+                logger.info(f"  Processing batch {i//AI_SUB_BATCH_SIZE + 1}/{(len(docs)-1)//AI_SUB_BATCH_SIZE + 1}...")
+                
+                tasks = [analyze_content_with_llm(d.get("page_content", ""), semaphore) for d in sub_docs]
+                sub_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for doc_idx_in_sub, (doc, result) in enumerate(zip(sub_docs, sub_results)):
+                    current_idx = i + doc_idx_in_sub + 1
+                    if isinstance(result, Exception):
+                        logger.warning(f"  Error analyzing record {current_idx}: {result}")
+                        metrics["processing_errors"] += 1
+                        continue
+                    
+                    if result.is_noise:
+                        metrics["noise_filtered"] += 1
+                        continue
+
+                    # 立即進行切片處理
+                    chunks = text_splitter.split_text(doc["page_content"])
+                    
+                    # 優化：針對此文件的這組 Chunks 一次查詢雜湊 (減少 DB 往返)
+                    chunk_indices_to_check = list(range(global_chunk_idx_for_file, global_chunk_idx_for_file + len(chunks)))
+                    existing_hashes = await get_existing_chunk_hashes(
+                        current_file_name, chunk_indices_to_check, db_connection, chroma_collection
+                    )
+
+                    for chunk_text in chunks:
+                        content_hash = hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()
+                        existing_hash = existing_hashes.get(global_chunk_idx_for_file)
+
+                        if existing_hash == content_hash:
+                            global_chunk_idx_for_file += 1
+                            continue
+                        
+                        current_batch_chunks.append({
+                            "file_name": current_file_name,
+                            "raw_content": chunk_text,
+                            "ai_summary": None,
+                            "data_source": doc.get("metadata", {}).get("data_source"),
+                            "content_category": result.content_category,
+                            "style_tags": result.generated_tags,
+                            "is_noise": result.is_noise,
+                            "information_weight": result.information_weight,
+                            "content_hash": content_hash,
+                            "chunk_index": global_chunk_idx_for_file,
+                            "original_time": doc.get("metadata", {}).get("original_time"),
+                        })
+                        file_chunks_count += 1
+                        global_chunk_idx_for_file += 1
+
+                        # 每達到 100 筆 Chunk 寫入一次資料庫
+                        if len(current_batch_chunks) >= BATCH_SIZE:
+                            await _insert_chunks_to_db(current_batch_chunks, db_connection, chroma_collection, semaphore, embedding_func, metrics)
+                            current_batch_chunks = []
+                            progress_data["metrics"] = metrics
+                            save_progress(progress_data)
+
+                logger.info(f"  Completed through record {min(i + AI_SUB_BATCH_SIZE, len(docs))}/{len(docs)}")
+            
+            logger.info(f"Finished file {current_file_name}. Chunks added: {file_chunks_count}")
 
             processed_files.append(filepath)
             total_files_processed_count += 1
