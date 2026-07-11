@@ -20,3 +20,8 @@ output_mask_data/*.json
 
 # Test folder
 test/
+log/rag_ingestion_pipeline/rag_ingestion_pipeline_20260711.log
+rag_pipeline_model/output_final_rag_data/chat_messages_rag_ready_mask.json
+rag_pipeline_model/output_final_rag_data/gmail_corpus_rag_ready_mask.json
+rag_pipeline_model/output_final_rag_data/meta_rag_ready_data_mask.json
+rag_pipeline_model/output_final_rag_data/personal_corpus_rag_ready_mask.json
