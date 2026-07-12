@@ -59,6 +59,7 @@ LM_STUDIO_API_KEY = os.getenv("LM_STUDIO_API_KEY", "lm-studio")
 
 LOG_DIR = os.getenv("LOG_DIR", "../log")
 PROC_DIR = os.getenv("PROC_DIR", "../processing")
+CACHE_DIR = os.getenv("CACHE_DIR", "../cache")
 PROCESS_NAME = "rag_ingestion_pipeline"
 
 # Batch processing size
@@ -67,10 +68,14 @@ BATCH_SIZE = 100
 # Ensure directories exist
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 Path(PROC_DIR).mkdir(parents=True, exist_ok=True)
+Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
 process_log_dir = Path(LOG_DIR) / PROCESS_NAME
 process_log_dir.mkdir(parents=True, exist_ok=True)
 process_proc_dir = Path(PROC_DIR) / PROCESS_NAME
 process_proc_dir.mkdir(parents=True, exist_ok=True)
+process_cache_dir = Path(CACHE_DIR) / PROCESS_NAME
+process_cache_dir.mkdir(parents=True, exist_ok=True)
 
 # Initialize OpenAI Client (used for OpenAI or local LM Studio)
 if AI_PROVIDER == "lm_studio":
@@ -147,6 +152,81 @@ def prompt_resume(progress_data):
             if response in ['y', 'n']:
                 return response == 'y'
     return False
+
+# ==========================================
+# Cache Management for Failed Batches
+# ==========================================
+def save_failed_batch_to_cache(chunks_batch: List[Dict[str, Any]], error_msg: str):
+    """Saves a failed batch of chunks to a JSON file in the cache directory."""
+    date_str = datetime.now().strftime("%Y%m%d")
+    unique_id = uuid.uuid4().hex[:8]
+    cache_filename = f"{PROCESS_NAME}_failed_{date_str}_{unique_id}.json"
+    cache_path = process_cache_dir / cache_filename
+    
+    cache_data = {
+        "failed_at": datetime.now().isoformat(),
+        "error": str(error_msg),
+        "chunks": chunks_batch
+    }
+    
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        logger.warning(f"Failed batch cached to: {cache_path}")
+    except Exception as e:
+        logger.error(f"Critical error: Could not save cache file: {e}")
+
+async def recover_from_cache(
+    db_connection: Optional[asyncpg.Connection],
+    chroma_collection: Optional[chromadb.api.models.Collection.Collection],
+    semaphore: asyncio.Semaphore,
+    embedding_func: Optional[Any],
+    metrics: Dict[str, Any]
+):
+    """Scans cache for failed batches and attempts to re-insert them."""
+    cache_files = list(process_cache_dir.glob(f"{PROCESS_NAME}_failed_*.json"))
+    if not cache_files:
+        return
+
+    logger.info(f"Found {len(cache_files)} failed batches in cache. Attempting recovery...")
+    
+    for cache_file in cache_files:
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            failed_chunks = cache_data.get("chunks", [])
+            if not failed_chunks:
+                cache_file.unlink()
+                continue
+
+            logger.info(f"  Recovering {len(failed_chunks)} chunks from {cache_file.name}...")
+            
+            # Apply "Anti-Stupid" fixes (like datetime parsing) to ensure recovery success
+            for chunk in failed_chunks:
+                orig_time = chunk.get("original_time")
+                if isinstance(orig_time, str):
+                    # Attempt to standardize it back to a datetime-like structure if needed
+                    # (The _insert_chunks_to_db handles the actual datetime object conversion)
+                    pass 
+
+            # Attempt insertion
+            try:
+                await _insert_chunks_to_db(
+                    failed_chunks, db_connection, chroma_collection, 
+                    semaphore, embedding_func, metrics, is_recovery=True
+                )
+                # If successful, delete the cache file
+                cache_file.unlink()
+                logger.info(f"  Successfully recovered batch {cache_file.name}")
+            except Exception as e:
+                logger.error(f"  Recovery failed again for {cache_file.name}: {e}")
+                # Leave the file in cache for next attempt
+
+        except Exception as e:
+            logger.error(f"  Error reading cache file {cache_file}: {e}")
+
+
 
 # ==========================================
 # 1. Pydantic Model for Structured Output
@@ -241,12 +321,13 @@ async def _insert_chunks_to_db(
     chroma_collection: Optional[chromadb.api.models.Collection.Collection],
     semaphore: asyncio.Semaphore,
     embedding_func: Optional[Any], # This could be chromadb's EmbeddingFunction or None
-    metrics: Dict[str, Any]
+    metrics: Dict[str, Any],
+    is_recovery: bool = False
 ):
     if not chunks_batch:
         return
 
-    logger.info(f"Inserting batch of {len(chunks_batch)} chunks into {VECTOR_DB_TYPE}...")
+    logger.info(f"{'[Recovery] ' if is_recovery else ''}Inserting batch of {len(chunks_batch)} chunks into {VECTOR_DB_TYPE}...")
 
     if VECTOR_DB_TYPE == "postgres":
         texts_to_embed = [c["raw_content"] for c in chunks_batch]
@@ -277,12 +358,33 @@ async def _insert_chunks_to_db(
 
         records_to_insert = []
         for i, chunk in enumerate(chunks_batch):
+            # Postgres asyncpg requires datetime objects for timestamptz columns ($12)
+            # Postgres asyncpg requires datetime objects for timestamptz columns
+            orig_time = chunk.get("original_time")
+            if isinstance(orig_time, str):
+                for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        orig_time = datetime.strptime(orig_time, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if isinstance(orig_time, str): # If all parsing fails, set to None to avoid DB crash
+                    orig_time = None
+            if isinstance(orig_time, str):
+                # Try to parse common timestamp formats found in RAG data
+                for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        orig_time = datetime.strptime(orig_time, fmt)
+                        break
+                    except ValueError:
+                        continue
+
             records_to_insert.append(
                 (
                     chunk["file_name"], chunk["raw_content"], chunk["ai_summary"],
                     chunk["data_source"], chunk["content_category"], chunk["style_tags"],
                     chunk["is_noise"], chunk["information_weight"], chunk["content_hash"],
-                    chunk["chunk_index"], embeddings[i], chunk["original_time"]
+                    chunk["chunk_index"], embeddings[i], orig_time
                 )
             )
         
@@ -312,8 +414,11 @@ async def _insert_chunks_to_db(
             logger.info(f"Successfully inserted/updated {len(records_to_insert)} chunks into Postgres.")
             metrics["successful_chunks"] += len(records_to_insert)
         except Exception as e:
-            logger.error(f"Failed to insert/update batch into Postgres: {e}")
+            error_msg = f"Failed to insert/update batch into Postgres: {e}"
+            logger.error(error_msg)
             metrics["processing_errors"] += len(records_to_insert) # Count as errors for these chunks
+            if not is_recovery: # Prevent infinite recovery loops
+                save_failed_batch_to_cache(chunks_batch, error_msg)
 
     elif VECTOR_DB_TYPE == "chromadb":
         try:
@@ -335,8 +440,11 @@ async def _insert_chunks_to_db(
             logger.info(f"Successfully inserted/updated {len(chunks_batch)} chunks into ChromaDB.")
             metrics["successful_chunks"] += len(chunks_batch)
         except Exception as e:
-            logger.error(f"Failed to insert/update batch into ChromaDB: {e}")
+            error_msg = f"Failed to insert/update batch into ChromaDB: {e}"
+            logger.error(error_msg)
             metrics["processing_errors"] += len(chunks_batch) # Count as errors for these chunks
+            if not is_recovery:
+                save_failed_batch_to_cache(chunks_batch, error_msg)
 
 async def parse_rag_ready_json(json_data: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
     """
@@ -563,6 +671,11 @@ async def process_and_ingest_data():
     else:
         raise ValueError(f"Unsupported VECTOR_DB_TYPE: {VECTOR_DB_TYPE}")
 
+    # --- Recovery Step ---
+    await recover_from_cache(
+        db_connection, chroma_collection, semaphore, embedding_func, metrics
+    )
+    # ---------------------
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
