@@ -10,6 +10,7 @@ python-dotenv
 chromadb
 asyncpg
 pgvector
+psycopg2-binary
 
 # Document parsing
 beautifulsoup4
@@ -26,3 +27,11 @@ spacy
 
 # Other utilities
 requests
+tiktoken
+GitPython
+pydantic-settings
+tqdm
+google-generativeai
+google-cloud-aiplatform
+google-cloud-storage
+sentence-transformers

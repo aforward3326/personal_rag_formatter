@@ -4,24 +4,26 @@
 
 # Local secrets and environment configuration
 .key/
-log/*.log
+*.log
 *.env
 !.env.example
 !pipeline.env.example
+venv/
+data/
+!data/templates/
+*.pyc
 
 # Example folder
 AI-Chat_example/
 
 # Data folders
-org_data/*/
+data/org_data/*/
 output_clean_data/*.json
 output_final_rag_data/*.json
 output_mask_data/*.json
+!test/data/gemini_test_data.json
 
 # Test folder
-test/
-log/rag_ingestion_pipeline/rag_ingestion_pipeline_20260711.log
-rag_pipeline_model/output_final_rag_data/chat_messages_rag_ready_mask.json
-rag_pipeline_model/output_final_rag_data/gmail_corpus_rag_ready_mask.json
-rag_pipeline_model/output_final_rag_data/meta_rag_ready_data_mask.json
-rag_pipeline_model/output_final_rag_data/personal_corpus_rag_ready_mask.json
+#test/
+
+
