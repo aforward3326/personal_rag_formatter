@@ -24,7 +24,7 @@ class CodeProcessingStep(PipelineStep):
 
         self.standard_client = AIProviderFactory.create_llm(
             provider=config.standard_ai_provider,
-            api_key=config.standard_api_key,
+            api_key=config.standard_ai_key,
             base_url=config.standard_base_url
         )
         self.thinking_client = AIProviderFactory.create_llm(
@@ -126,7 +126,8 @@ class CodeProcessingStep(PipelineStep):
         
         # 5. Generate embedding for the chunk content itself
         text_to_embed = chunk['content']
-        embedding_vector = self.embedder.embed([text_to_embed])[0]
+        # The embed method now returns a list of vectors. Since we pass one text, we get one vector.
+        embedding_vector = self.embedder.embed(text_to_embed)[0]
         
         # 6. Assemble the final record
         return {
