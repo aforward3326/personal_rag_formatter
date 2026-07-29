@@ -1,6 +1,6 @@
 import os
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 
@@ -49,18 +49,24 @@ class CodeChunkerAndSanitizer:
             
         return text
 
-    def process_file(self, file_path: str) -> List[Dict[str, Any]]:
-        """Reads, sanitizes, and chunks a single file."""
+    def process_file(self, file_path: str, content: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Reads, sanitizes, and chunks a single file.
+        If content is provided, it skips reading the file from disk.
+        """
         _, ext = os.path.splitext(file_path)
         if ext not in self.SUPPORTED_EXTS:
             return []
 
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                original_text = f.read()
-        except Exception as e:
-            self.logger.warning(f"Could not read file {file_path}: {e}")
-            return []
+        if content is None:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    original_text = f.read()
+            except Exception as e:
+                self.logger.warning(f"Could not read file {file_path}: {e}")
+                return []
+        else:
+            original_text = content
 
         sanitized_text = self.sanitize(original_text)
         lang = self.EXT_TO_LANG.get(ext)
@@ -85,3 +91,19 @@ class CodeChunkerAndSanitizer:
                 "language": ext.strip('.')
             })
         return results
+    
+    def get_language(self, file_path: str) -> Optional[str]:
+        """Returns the language extension for a given file path."""
+        _, ext = os.path.splitext(file_path)
+        return ext.strip('.') if ext in self.SUPPORTED_EXTS else None
+
+    def read_file_content(self, file_path: str) -> Optional[str]:
+        """Reads and returns the content of a file if supported."""
+        if self.get_language(file_path) is None:
+            return None
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            self.logger.warning(f"Could not read file {file_path}: {e}")
+            return None
