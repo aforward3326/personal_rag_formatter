@@ -2,96 +2,132 @@ pipeline {
     agent any
 
     parameters {
-        booleanParam(name: 'RESUME_MODE', defaultValue: false, description: '勾選此項以載入 Checkpoint，從上次失敗的 Step 繼續執行')
-        string(name: 'RESUME_BATCH_ID', defaultValue: '', description: '輸入 Batch ID (如 cicd_xxx) 以跳過 LLM 批次提交，直接抓取並處理結果')
+        booleanParam(name: 'USE_BATCH_API', defaultValue: false, description: 'Check this to use the batch processing API.')
+        booleanParam(name: 'RESUME_MODE', defaultValue: false, description: 'Check this to load a checkpoint and resume execution from the last failed step.')
+        string(name: 'RESUME_BATCH_ID', defaultValue: '', description: 'Enter a Batch ID (e.g., cicd_xxx) to skip LLM batch submission and directly fetch and process the results.')
     }
 
     environment {
-        // SSH connection info for the remote host
+        // SSH connection info
         REMOTE_HOST = '192.168.x.x'
         REMOTE_USER = 'admin'
         LOCAL_PC_CRED_ID = 'CRED_ID'
         NAS_GIT_CRED_ID  = 'CRED_ID'
 
-        // Absolute path to the RAG project on the remote host (directory containing Python code)
+        // Project paths
         RAG_PROJECT_DIR = 'your-path'
         LOCAL_REPO_PATH = 'your-path'
+        BASE_WORKSPACE_DIR = '/tmp/rag_workspace'
+        LOG_DIR = '/tmp/rag_workspace/logs'
 
-        // Required environment variables for the RAG program
-        LLM_PROVIDER = 'gemini_vertex'
-        USE_BATCH_API = true
-        GCS_BUCKET_NAME = 'your_process'
+        // Core project settings
         PROJECT_NAME = 'your-project'
         PROGRAM_TYPE = 'python'
         GIT_URL      = 'your-git'
         BRANCH       = 'main'
-        BATCH_MODEL_NAME = 'gemini-2.5-flash'
-        EMBEDDING_PROVIDER = 'lm_studio'
-        EMBEDDING_MODEL_NAME = 'text-embedding-nomic-embed-code'
+        LOG_LEVEL = 'INFO'
 
-        // Database connection settings
+        // --- Dual-track LLM Provider Settings ---
+        ROUTING_STRATEGY = "auto" // auto, always_standard, always_thinking
+
+        // --- Standard Track Settings ---
+        STANDARD_AI_PROVIDER = "lm_studio"
+        STANDARD_MODEL_NAME = "local-model/gemma-2b-it-q8_0.gguf"
+        STANDARD_BASE_URL = "http://192.168.x.x:1234/v1"
+        // STANDARD_API_KEY is set from credentials
+
+        // --- Thinking Track Settings ---
+        THINKING_AI_PROVIDER = "vertex"
+        THINKING_MODEL_NAME = "gemini-1.5-pro"
+        // THINKING_API_KEY is set from credentials
+        THINKING_BASE_URL = "" // Not needed for Vertex
+
+        // --- Embedding Settings ---
+        EMBEDDING_PROVIDER = 'lm_studio'
+        EMBEDDING_MODEL_NAME = 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+        EMBEDDING_DIM = 768
+        EMBEDDING_BASE_URL = 'http://192.168.x.x:1234/v1'
+        // EMBEDDING_API_KEY is set from credentials
+
+        // Batch Processing & Cloud Settings
+        GCS_BUCKET_NAME = 'your_process'
+        GOOGLE_CLOUD_LOCATION = 'us-central1'
+
+        // Database settings
         DB_HOST      = '192.168.x.x'
         DB_PORT      = '5432'
         DB_USER      = 'postgres'
         DB_NAME      = 'db'
         DB_TABLE_NAME   = 'table'
-
-        // Local LLM service settings
-        LM_STUDIO_BASE_URL = 'http://localhost:1234/v1'
     }
 
     stages {
-        stage('Deploy & Execute on Local Computer') {
+        stage('Deploy & Execute RAG Pipeline') {
             steps {
                 sshagent(credentials: [LOCAL_PC_CRED_ID, NAS_GIT_CRED_ID]) {
                     script {
-                        // Bind credentials as environment variables for this block
                         withCredentials([
-                            string(credentialsId: 'your-id', variable: 'DB_PASSWORD'),
-                            string(credentialsId: 'gemini-api-key-id', variable: 'GEMINI_API_KEY'),
-                            string(credentialsId: 'lm_studio_key', variable: 'LM_STUDIO_API_KEY')
+                            string(credentialsId: 'your-db-password-id', variable: 'DB_PASSWORD'),
+                            string(credentialsId: 'your-standard-api-key-id', variable: 'STANDARD_API_KEY'), // e.g., LM Studio key
+                            string(credentialsId: 'your-thinking-api-key-id', variable: 'THINKING_API_KEY'), // e.g., Gemini/Vertex key
+                            string(credentialsId: 'your-embedding-api-key-id', variable: 'EMBEDDING_API_KEY') // e.g., LM Studio key
                         ]) {
 
                             def resumeFlag = params.RESUME_MODE ? '--resume' : ''
                             def resumeBatchFlag = params.RESUME_BATCH_ID ? "--resume-batch-id ${params.RESUME_BATCH_ID}" : ''
+                            def useBatchApi = params.USE_BATCH_API ? 'true' : 'false'
 
                             def remoteCmd = """
-                                # 1. Enter the target code repository and update via Git
-                                cd ${LOCAL_REPO_PATH} && \\
-                                git fetch origin && \\
-                                git checkout ${BRANCH} && \\
-                                git pull origin ${BRANCH} && \\
+                                # 1. Update code repositories
+                                cd ${LOCAL_REPO_PATH} && git fetch origin && git checkout ${BRANCH} && git pull origin ${BRANCH}
+                                cd ${RAG_PROJECT_DIR}
 
-                                # 2. Switch to the RAG program directory to prepare for execution
-                                cd ${RAG_PROJECT_DIR} && \\
+                                # 2. Export environment variables
+                                export PROJECT_NAME='${PROJECT_NAME}'
+                                export PROGRAM_TYPE='${PROGRAM_TYPE}'
+                                export GIT_URL='${GIT_URL}'
+                                export BRANCH='${BRANCH}'
+                                export LOCAL_REPO_PATH='${LOCAL_REPO_PATH}'
+                                export DB_TABLE_NAME='${DB_TABLE_NAME}'
+                                export DB_HOST='${DB_HOST}'
+                                export DB_PORT='${DB_PORT}'
+                                export DB_USER='${DB_USER}'
+                                export DB_PASSWORD='\${DB_PASSWORD}'
+                                export DB_NAME='${DB_NAME}'
+                                export BASE_WORKSPACE_DIR='${BASE_WORKSPACE_DIR}'
+                                export LOG_LEVEL='${LOG_LEVEL}'
+                                export LOG_DIR='${LOG_DIR}'
 
-                                # 3. Export all required environment variables for the RAG program (no spaces around equals, ends with && \\)
-                                export PROJECT_NAME='${PROJECT_NAME}' && \\
-                                export PROGRAM_TYPE='${PROGRAM_TYPE}' && \\
-                                export GIT_URL='${GIT_URL}' && \\
-                                export BRANCH='${BRANCH}' && \\
-                                export LOCAL_REPO_PATH='${LOCAL_REPO_PATH}' && \\
-                                export DB_TABLE_NAME='${DB_TABLE_NAME}' && \\
-                                export DB_HOST='${DB_HOST}' && \\
-                                export DB_PORT='${DB_PORT}' && \\
-                                export DB_USER='${DB_USER}' && \\
-                                export DB_PASSWORD='\${DB_PASSWORD}' && \\
-                                export DB_NAME='${DB_NAME}' && \\
-                                export LM_STUDIO_BASE_URL='${LM_STUDIO_BASE_URL}' && \\
-                                export LLM_PROVIDER='${LLM_PROVIDER}' && \\
-                                export GEMINI_API_KEY='\${GEMINI_API_KEY}' && \\
-                                export LM_STUDIO_API_KEY='\${LM_STUDIO_API_KEY}' && \\
-                                export USE_BATCH_API='true' && \\
-                                export BATCH_MODEL_NAME='${BATCH_MODEL_NAME}' && \\
-                                export GOOGLE_CLOUD_PROJECT='${PROJECT_NAME}' && \\
-                                export GCS_BUCKET_NAME='${GCS_BUCKET_NAME}' && \\
-                                export GOOGLE_APPLICATION_CREDENTIALS='/path/to/your/gcp-service-account-key.json' && \
-                                export EMBEDDING_PROVIDER='${EMBEDDING_PROVIDER}' && \\
-                                export EMBEDDING_MODEL_NAME='${EMBEDDING_MODEL_NAME}' && \\
+                                # Export Batch and Cloud Settings
+                                export USE_BATCH_API='${useBatchApi}'
+                                export GOOGLE_CLOUD_PROJECT='${PROJECT_NAME}'
+                                export GCS_BUCKET_NAME='${GCS_BUCKET_NAME}'
+                                export GOOGLE_CLOUD_LOCATION='${GOOGLE_CLOUD_LOCATION}'
+                                export GOOGLE_APPLICATION_CREDENTIALS='/path/to/your/gcp-service-account-key.json'
 
-                                # 4. Execute the RAG Pipeline
-                                source venv/bin/activate && \\
-                                cd src && \\
+                                # Export LLM Provider Settings
+                                export ROUTING_STRATEGY='${ROUTING_STRATEGY}'
+
+                                export STANDARD_AI_PROVIDER='${STANDARD_AI_PROVIDER}'
+                                export STANDARD_MODEL_NAME='${STANDARD_MODEL_NAME}'
+                                export STANDARD_API_KEY='\${STANDARD_API_KEY}'
+                                export STANDARD_BASE_URL='${STANDARD_BASE_URL}'
+
+                                export THINKING_AI_PROVIDER='${THINKING_AI_PROVIDER}'
+                                export THINKING_MODEL_NAME='${THINKING_MODEL_NAME}'
+                                export THINKING_API_KEY='\${THINKING_API_KEY}'
+                                export THINKING_BASE_URL='${THINKING_BASE_URL}'
+
+                                # Export Embedding Settings
+                                export EMBEDDING_PROVIDER='${EMBEDDING_PROVIDER}'
+                                export EMBEDDING_MODEL_NAME='${EMBEDDING_MODEL_NAME}'
+                                export EMBEDDING_DIM='${EMBEDDING_DIM}'
+                                export EMBEDDING_API_KEY='\${EMBEDDING_API_KEY}'
+                                export EMBEDDING_BASE_URL='${EMBEDDING_BASE_URL}'
+
+                                # 3. Execute the RAG Pipeline
+                                source venv/bin/activate
+                                cd src
                                 python3 -m cicd_pipeline.main --pipeline code_rag ${resumeFlag} ${resumeBatchFlag}
                             """
 
@@ -106,10 +142,10 @@ pipeline {
 
     post {
         success {
-            echo 'CI/CD pipeline executed successfully. RAG data updated and imported into the database!'
+            echo 'CI/CD pipeline executed successfully.'
         }
         failure {
-            echo 'Pipeline execution failed. Please check the network connection to the remote host or the Python error logs.'
+            echo 'Pipeline execution failed. Check logs for details.'
         }
     }
 }
