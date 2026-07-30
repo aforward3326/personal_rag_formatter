@@ -3,7 +3,6 @@ import json
 import uuid
 import hashlib
 import asyncio
-import aiohttp
 from typing import Dict, Any, List
 
 from .base import PipelineStep
@@ -73,14 +72,14 @@ class BatchCodeProcessingStep(PipelineStep):
                 job_id = self._submit_job([r['api_request'] for r in standard_reqs], "standard", self.standard_client, full_system_prompt, is_thinking_mode=False)
                 jobs_to_track[job_id] = {"mode": "standard", "status": "pending"}
             else:
-                tasks.append(self._process_realtime_batch(standard_reqs, self.standard_client))
+                tasks.append(self._process_realtime_batch(standard_reqs, self.standard_client, is_thinking_mode=False))
 
         if thinking_reqs:
             if self.config.thinking_ai_provider in ['vertex', 'gemini']:
                 job_id = self._submit_job([r['api_request'] for r in thinking_reqs], "thinking", self.thinking_client, full_system_prompt, is_thinking_mode=True)
                 jobs_to_track[job_id] = {"mode": "thinking", "status": "pending"}
             else:
-                tasks.append(self._process_realtime_batch(thinking_reqs, self.thinking_client))
+                tasks.append(self._process_realtime_batch(thinking_reqs, self.thinking_client, is_thinking_mode=True))
 
         results_from_realtime = await asyncio.gather(*tasks)
         processed_records = [record for sublist in results_from_realtime for record in sublist]
@@ -94,30 +93,29 @@ class BatchCodeProcessingStep(PipelineStep):
         self.logger.info(f"Completed real-time processing. Generated {len(processed_records)} records.")
         return context
 
-    async def _process_realtime_batch(self, requests: List[Dict], client) -> List[Dict]:
-        """Processes a batch of requests in real-time for providers like LM Studio."""
-        # This is a placeholder for a more robust concurrent implementation using aiohttp
-        records = []
-        for req_data in requests:
+    async def _process_realtime_batch(self, requests: List[Dict], client, is_thinking_mode: bool) -> List[Dict]:
+        """Processes a batch of requests concurrently in real-time for providers like LM Studio."""
+        
+        async def process_one(req_data: Dict):
             try:
-                # Use the analyze method which is already available on the client
+                api_request = req_data['api_request']
                 llm_analysis, _, _ = await client.analyze_batch(
                     req_data['metadata']['chunk'],
-                    req_data['api_request']['body']['messages'][0]['content'], # system prompt
-                    req_data['api_request']['body']['model'],
+                    api_request['body']['messages'][0]['content'], # system prompt
+                    api_request['body']['model'],
                     None,
-                    is_thinking_mode=self.config.thinking_ai_provider not in ['vertex', 'gemini']
+                    is_thinking_mode=is_thinking_mode
                 )
 
-                # Combine with metadata to form the full record
+                if not llm_analysis: # If analysis failed and returned empty dict
+                    return None
+
                 metadata = req_data['metadata']
                 chunk = metadata['chunk']
-                
                 combined_analysis = {**metadata['regex_analysis'], **llm_analysis}
-                
                 embedding_vector = self.embedder.embed(chunk['content'])[0]
 
-                record = {
+                return {
                     "id": metadata['chunk_id'],
                     "content": chunk['content'],
                     "repository": self.config.git_url,
@@ -135,16 +133,23 @@ class BatchCodeProcessingStep(PipelineStep):
                     "dependencies": combined_analysis.get('dependencies', []),
                     "embedding": embedding_vector
                 }
-                records.append(record)
             except Exception as e:
-                self.logger.error(f"Failed to process real-time request for {req_data['metadata']['relative_path']}: {e}", exc_info=True)
-        return records
+                self.logger.error(f"Failed to process real-time request for {req_data.get('metadata', {}).get('relative_path', 'unknown')}: {e}", exc_info=True)
+                return None
+
+        self.logger.info(f"Processing {len(requests)} requests in real-time for provider {client.__class__.__name__}...")
+        tasks = [process_one(req) for req in requests]
+        results = await asyncio.gather(*tasks)
+        
+        # Filter out None results from failed tasks
+        return [record for record in results if record is not None]
 
     def resume(self, context: Dict[str, Any]) -> Dict[str, Any]:
         # Resume logic needs to be fully implemented to process results from GCS
         return context
 
     def _prepare_requests(self, repo_path: str, system_prompt: str, commit_hash: str) -> (List[Dict], List[Dict]):
+        # This method remains the same
         standard_requests = []
         thinking_requests = []
 
@@ -181,6 +186,7 @@ class BatchCodeProcessingStep(PipelineStep):
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": chunk['content']}
                             ],
+                            "response_format": {"type": "json_object"},
                         }
                     }
                     
@@ -202,6 +208,7 @@ class BatchCodeProcessingStep(PipelineStep):
         return standard_requests, thinking_requests
 
     def _submit_job(self, requests: List[Dict], mode: str, client, system_prompt: str, is_thinking_mode: bool) -> str:
+        # This method remains the same
         batch_id = f"{mode}_{uuid.uuid4().hex[:8]}"
         input_file_path = os.path.join(self.config.base_workspace_dir, f"{batch_id}_input.jsonl")
         
