@@ -34,6 +34,12 @@ class BatchCodeProcessingStep(PipelineStep):
         )
         self.router = HybridRouter(self.embedder)
         self.BATCH_JOB_FILE = os.path.join(config.base_workspace_dir, "batch_jobs.json")
+        
+        # Limit concurrency for local LLM calls to avoid overwhelming the server (e.g., LM Studio)
+        concurrency = getattr(config, 'local_llm_concurrency', 1)
+        self.logger.info(f"Using local LLM concurrency of: {concurrency}")
+        self.semaphore = asyncio.Semaphore(concurrency)
+
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
         return asyncio.run(self.arun(context))
@@ -220,43 +226,45 @@ class BatchCodeProcessingStep(PipelineStep):
         return records
 
     async def _execute_realtime_analysis(self, work_item: Dict, client, system_prompt: str) -> Optional[Dict]:
-        metadata = work_item['metadata']
-        chunk = metadata['chunk']
-        try:
-            model_name = self.config.thinking_model_name if work_item['use_thinking_client'] else self.config.standard_model_name
+        async with self.semaphore:
+            metadata = work_item['metadata']
+            chunk = metadata['chunk']
+            try:
+                self.logger.debug(f"Processing item for {metadata['relative_path']} line {chunk['start_line']}")
+                model_name = self.config.thinking_model_name if work_item['use_thinking_client'] else self.config.standard_model_name
 
-            llm_analysis, _, _ = await client.analyze_batch(
-                chunk, system_prompt, model_name, None, is_thinking_mode=work_item['use_thinking_client']
-            )
+                llm_analysis, _, _ = await client.analyze_batch(
+                    chunk, system_prompt, model_name, None, is_thinking_mode=work_item['use_thinking_client']
+                )
 
-            if not llm_analysis:
-                self.logger.warning(f"LLM analysis returned empty for {metadata['relative_path']}. Skipping record.")
+                if not llm_analysis:
+                    self.logger.warning(f"LLM analysis returned empty for {metadata['relative_path']}. Skipping record.")
+                    return None
+
+                combined_analysis = {**metadata['regex_analysis'], **llm_analysis}
+                embedding_vector = self.embedder.embed(chunk['content'])[0]
+
+                return {
+                    "id": metadata['chunk_id'],
+                    "content": chunk['content'],
+                    "repository": self.config.git_url,
+                    "branch": self.config.branch,
+                    "commit_hash": metadata['commit_hash'],
+                    "file_path": metadata['relative_path'],
+                    "language": chunk['language'],
+                    "node_type": combined_analysis.get('node_type', 'unknown'),
+                    "node_name": combined_analysis.get('node_name', ''),
+                    "start_line": chunk['start_line'],
+                    "end_line": chunk['end_line'],
+                    "summary_zh": combined_analysis.get('summary_zh', ''),
+                    "summary_en": combined_analysis.get('summary_en', ''),
+                    "tags": combined_analysis.get('tags', []),
+                    "dependencies": combined_analysis.get('dependencies', []),
+                    "embedding": embedding_vector
+                }
+            except Exception as e:
+                self.logger.error(f"Failed to process real-time item for {metadata['relative_path']}: {e}", exc_info=True)
                 return None
-
-            combined_analysis = {**metadata['regex_analysis'], **llm_analysis}
-            embedding_vector = self.embedder.embed(chunk['content'])[0]
-
-            return {
-                "id": metadata['chunk_id'],
-                "content": chunk['content'],
-                "repository": self.config.git_url,
-                "branch": self.config.branch,
-                "commit_hash": metadata['commit_hash'],
-                "file_path": metadata['relative_path'],
-                "language": chunk['language'],
-                "node_type": combined_analysis.get('node_type', 'unknown'),
-                "node_name": combined_analysis.get('node_name', ''),
-                "start_line": chunk['start_line'],
-                "end_line": chunk['end_line'],
-                "summary_zh": combined_analysis.get('summary_zh', ''),
-                "summary_en": combined_analysis.get('summary_en', ''),
-                "tags": combined_analysis.get('tags', []),
-                "dependencies": combined_analysis.get('dependencies', []),
-                "embedding": embedding_vector
-            }
-        except Exception as e:
-            self.logger.error(f"Failed to process real-time item for {metadata['relative_path']}: {e}", exc_info=True)
-            return None
 
     def _prepare_work_items(self, repo_path: str, commit_hash: str) -> List[Dict]:
         work_items = []
