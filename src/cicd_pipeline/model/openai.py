@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Dict
 from openai import AsyncOpenAI, OpenAI
 from .base import BaseAIProvider
 
