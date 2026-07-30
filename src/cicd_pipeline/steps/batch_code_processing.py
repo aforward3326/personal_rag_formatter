@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 
 from .base import PipelineStep
 from .processing.chunker import CodeChunkerAndSanitizer
+from .processing.metadata_extractor import CodeMetadataExtractor
 from ..model.factory import AIProviderFactory
 from .processing.embedder import Embedder
 from ..utils.routing import HybridRouter
@@ -19,6 +20,7 @@ class BatchCodeProcessingStep(PipelineStep):
         super().__init__(config, **kwargs)
         self.config = config
         self.chunker = CodeChunkerAndSanitizer()
+        self.metadata_extractor = CodeMetadataExtractor()
 
         self.standard_client = AIProviderFactory.create_llm(
             provider=config.standard_ai_provider,
@@ -44,7 +46,6 @@ class BatchCodeProcessingStep(PipelineStep):
         self.BATCH_JOB_FILE = os.path.join(config.base_workspace_dir, "batch_jobs.json")
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        # The main execution is now async
         return asyncio.run(self.arun(context))
 
     async def arun(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -62,87 +63,88 @@ class BatchCodeProcessingStep(PipelineStep):
         repo_context = build_repo_context(repo_path)
         full_system_prompt = f"{repo_context}\n\n{SYSTEM_PROMPT_TEMPLATE}" if repo_context else SYSTEM_PROMPT_TEMPLATE
 
-        standard_reqs, thinking_reqs = self._prepare_requests(repo_path, full_system_prompt)
+        standard_reqs, thinking_reqs = self._prepare_requests(repo_path, full_system_prompt, commit_hash)
         
         tasks = []
         jobs_to_track = {}
         
-        # Process Standard Track
         if standard_reqs:
             if self.config.standard_ai_provider in ['vertex', 'gemini']:
-                job_id = self._submit_job(standard_reqs, "standard", self.standard_client, full_system_prompt, is_thinking_mode=False)
+                job_id = self._submit_job([r['api_request'] for r in standard_reqs], "standard", self.standard_client, full_system_prompt, is_thinking_mode=False)
                 jobs_to_track[job_id] = {"mode": "standard", "status": "pending"}
-            else: # Real-time processing for lm_studio, openai, etc.
-                tasks.append(self._process_realtime_batch(standard_reqs, self.standard_client, commit_hash))
+            else:
+                tasks.append(self._process_realtime_batch(standard_reqs, self.standard_client))
 
-        # Process Thinking Track
         if thinking_reqs:
             if self.config.thinking_ai_provider in ['vertex', 'gemini']:
-                job_id = self._submit_job(thinking_reqs, "thinking", self.thinking_client, full_system_prompt, is_thinking_mode=True)
+                job_id = self._submit_job([r['api_request'] for r in thinking_reqs], "thinking", self.thinking_client, full_system_prompt, is_thinking_mode=True)
                 jobs_to_track[job_id] = {"mode": "thinking", "status": "pending"}
             else:
-                tasks.append(self._process_realtime_batch(thinking_reqs, self.thinking_client, commit_hash))
+                tasks.append(self._process_realtime_batch(thinking_reqs, self.thinking_client))
 
-        # Execute all real-time tasks concurrently
         results_from_realtime = await asyncio.gather(*tasks)
-        
-        # Flatten the list of lists into a single list of records
         processed_records = [record for sublist in results_from_realtime for record in sublist]
 
         if jobs_to_track:
             with open(self.BATCH_JOB_FILE, 'w') as f:
                 json.dump(jobs_to_track, f)
             self.logger.info(f"Submitted batch jobs to track: {jobs_to_track}")
-            # If there are jobs to track, we might need to resume later
-            # For now, we'll just return the records we have
         
         context['processed_records'] = processed_records
         self.logger.info(f"Completed real-time processing. Generated {len(processed_records)} records.")
-        
-        # Optionally, you could chain resume logic here if needed
         return context
 
-    async def _process_realtime_batch(self, requests: List[Dict], client, commit_hash: str) -> List[Dict]:
-        """Processes a batch of requests in real-time using asyncio and aiohttp."""
+    async def _process_realtime_batch(self, requests: List[Dict], client) -> List[Dict]:
+        """Processes a batch of requests in real-time for providers like LM Studio."""
+        # This is a placeholder for a more robust concurrent implementation using aiohttp
         records = []
-        # In a real implementation, you would use aiohttp to send these requests concurrently
-        self.logger.info(f"Processing {len(requests)} requests in real-time for provider.")
-        for req in requests:
-            # This is a simplified loop. A real implementation would use asyncio.gather with aiohttp
+        for req_data in requests:
             try:
-                chunk_content = req['body']['messages'][-1]['content']
-                # This is a placeholder for the actual analysis call
-                # In a real scenario, you'd call client.analyze here
-                llm_analysis = {"summary_en": "Real-time analysis placeholder", "summary_zh": "", "tags": []}
+                # Use the analyze method which is already available on the client
+                llm_analysis, _, _ = await client.analyze_batch(
+                    req_data['metadata']['chunk'],
+                    req_data['api_request']['body']['messages'][0]['content'], # system prompt
+                    req_data['api_request']['body']['model'],
+                    None,
+                    is_thinking_mode=self.config.thinking_ai_provider not in ['vertex', 'gemini']
+                )
+
+                # Combine with metadata to form the full record
+                metadata = req_data['metadata']
+                chunk = metadata['chunk']
                 
-                # Reconstruct necessary info from custom_id
-                relative_path, start_line_str = req['custom_id'].split('::')
+                combined_analysis = {**metadata['regex_analysis'], **llm_analysis}
                 
-                # Create a record (simplified version)
+                embedding_vector = self.embedder.embed(chunk['content'])[0]
+
                 record = {
-                    "id": hashlib.md5(f"{relative_path}{start_line_str}".encode()).hexdigest(),
-                    "content": chunk_content,
-                    "file_path": relative_path,
-                    "commit_hash": commit_hash,
-                    # ... other fields
+                    "id": metadata['chunk_id'],
+                    "content": chunk['content'],
+                    "repository": self.config.git_url,
+                    "branch": self.config.branch,
+                    "commit_hash": metadata['commit_hash'],
+                    "file_path": metadata['relative_path'],
+                    "language": chunk['language'],
+                    "node_type": combined_analysis.get('node_type', 'unknown'),
+                    "node_name": combined_analysis.get('node_name', ''),
+                    "start_line": chunk['start_line'],
+                    "end_line": chunk['end_line'],
+                    "summary_zh": combined_analysis.get('summary_zh', ''),
+                    "summary_en": combined_analysis.get('summary_en', ''),
+                    "tags": combined_analysis.get('tags', []),
+                    "dependencies": combined_analysis.get('dependencies', []),
+                    "embedding": embedding_vector
                 }
                 records.append(record)
             except Exception as e:
-                self.logger.error(f"Failed to process real-time request: {e}")
-                continue
+                self.logger.error(f"Failed to process real-time request for {req_data['metadata']['relative_path']}: {e}", exc_info=True)
         return records
 
     def resume(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        # Resume logic remains largely the same, focused on true batch jobs
-        if not os.path.exists(self.BATCH_JOB_FILE):
-            self.logger.warning("Batch job file not found. Nothing to resume.")
-            context['processed_records'] = []
-            return context
-        # ... existing resume logic ...
+        # Resume logic needs to be fully implemented to process results from GCS
         return context
 
-    def _prepare_requests(self, repo_path: str, system_prompt: str) -> (List[Dict], List[Dict]):
-        # This method remains the same
+    def _prepare_requests(self, repo_path: str, system_prompt: str, commit_hash: str) -> (List[Dict], List[Dict]):
         standard_requests = []
         thinking_requests = []
 
@@ -163,26 +165,43 @@ class BatchCodeProcessingStep(PipelineStep):
 
                 chunks = self.chunker.process_file(file_path, content)
                 for chunk in chunks:
-                    request_body = {
+                    regex_analysis = self.metadata_extractor.extract(chunk['content'], chunk['language'])
+                    hash_input = f"{self.config.git_url}|{self.config.branch}|{relative_path}|{regex_analysis.get('node_name', '')}|{chunk['start_line']}".encode('utf-8')
+                    chunk_id = hashlib.md5(hash_input).hexdigest()
+
+                    model_name = self.config.thinking_model_name if use_thinking_client else self.config.standard_model_name
+                    
+                    api_request = {
                         "custom_id": f"{relative_path}::{chunk['start_line']}",
                         "method": "POST",
                         "url": "/v1/chat/completions",
                         "body": {
-                            "model": self.config.thinking_model_name if use_thinking_client else self.config.standard_model_name,
+                            "model": model_name,
                             "messages": [
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": chunk['content']}
                             ],
                         }
                     }
+                    
+                    full_request_data = {
+                        "api_request": api_request,
+                        "metadata": {
+                            "chunk": chunk,
+                            "chunk_id": chunk_id,
+                            "commit_hash": commit_hash,
+                            "relative_path": relative_path,
+                            "regex_analysis": regex_analysis
+                        }
+                    }
+                    
                     if use_thinking_client:
-                        thinking_requests.append(request_body)
+                        thinking_requests.append(full_request_data)
                     else:
-                        standard_requests.append(request_body)
+                        standard_requests.append(full_request_data)
         return standard_requests, thinking_requests
 
     def _submit_job(self, requests: List[Dict], mode: str, client, system_prompt: str, is_thinking_mode: bool) -> str:
-        # This method remains the same for true batch providers
         batch_id = f"{mode}_{uuid.uuid4().hex[:8]}"
         input_file_path = os.path.join(self.config.base_workspace_dir, f"{batch_id}_input.jsonl")
         
